@@ -1,156 +1,180 @@
-setwd('G:/My Drive/lab files/pancreas targeting/GTEx islet enrichments/datasets')
-sex_table = read.delim('GTEx_Analysis_v8_Annotations_SubjectPhenotypesDS.txt')
+#!/usr/bin/env Rscript
 
+# Rank GTEx gene–tissue pairs by their association with pancreatic
+# insulin-secretion gene expression, then plot the rankings and compare
+# one candidate's cross-tissue and within-tissue scores.
+#
+# From the repository root:
+#   Rscript "script for crosstissue correlation with pancreas pathways.R" /path/to/datasets /path/to/results
+#
+# Defaults: datasets ./datasets, output ./results, WGCNA threads 1.
+# Set SLURM_CPUS_PER_TASK (provided by Slurm) to use allocated cores.
+# Install WGCNA, ggplot2, and forcats before running.
 
-#install.packages('BiocManager')
-library(WGCNA)
-#BiocManager::install('WGCNA')
+args <- commandArgs(trailingOnly = TRUE)
+if (length(args) > 2L) stop("Usage: Rscript <script> [dataset_dir] [output_dir]")
+dataset_dir <- if (length(args) >= 1L) args[[1L]] else "datasets"
+output_dir <- if (length(args) >= 2L) args[[2L]] else "results"
+
+input_files <- file.path(dataset_dir, c(
+  expression = "GTEx NA included env.RData",
+  phenotypes = "GTEx_Analysis_v8_Annotations_SubjectPhenotypesDS.txt",
+  secreted = "uniprot-secreted-filtered-organism__Homo+sapiens+(Human)+[9606]_.tab",
+  ontology = "uniprot-human-genes and goterms mapping.tab"
+))
+names(input_files) <- c("expression", "phenotypes", "secreted", "ontology")
+missing_files <- input_files[!file.exists(input_files)]
+if (length(missing_files)) {
+  stop("Missing input files:\n", paste(missing_files, collapse = "\n"))
+}
+
 library(ggplot2)
-install.packages('Rmisc')
+threads <- as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", "1"))
+if (is.na(threads) || threads < 1L) stop("SLURM_CPUS_PER_TASK must be a positive integer.")
+if (threads > 1L) WGCNA::allowWGCNAThreads(nThreads = threads)
 
-library(hexbin)
-library(dplyr)
-library(ggrepel)
-library(Rmisc)
-library(reshape2)
-allowWGCNAThreads()
-#Try top percentile cor across tissues
-load('G:/My Drive/lab files/pancreas targeting/GTEx islet enrichments/datasets/GTEx NA included env.RData')
+# 1. Load the manuscript's prefiltered GTEx v8 expression data.
+#    The saved table has one row per gene–tissue pair. Transpose it so
+#    that rows are donors and columns are gene–tissue pairs.
+workspace <- new.env()
+load(input_files[["expression"]], envir = workspace)
+expression <- workspace$GTEx_subfiltered
+if (is.null(expression$gene_tissue)) {
+  stop("The GTEx workspace must contain GTEx_subfiltered with a gene_tissue column.")
+}
+rownames(expression) <- expression$gene_tissue
+expression$gene_tissue <- NULL
+expression <- as.data.frame(t(expression))
+rm(workspace)
 
-working_dataset=GTEx_subfiltered
-row.names(working_dataset) = working_dataset$gene_tissue
-working_dataset$gene_tissue=NULL
-working_dataset = as.data.frame(t(working_dataset))
-working_dataset[1:5,1:5]
-sex_table = read.delim('G:/My Drive/lab files/pancreas targeting/GTEx islet enrichments/datasets/GTEx_Analysis_v8_Annotations_SubjectPhenotypesDS.txt')
-sex_table$GTEx_ID = gsub('GTEX-', '', sex_table$SUBJID)
-sex_table$sexMF = ifelse(sex_table$SEX==1, 'M', 'F')
-table(sex_table$sexMF)
+# The original workflow checks donor sex counts for context. Donor sex
+# is neither a filter nor a covariate in the correlation analysis.
+phenotypes <- read.delim(input_files[["phenotypes"]])
+donor_ids <- sub("^GTEX-", "", phenotypes$SUBJID)
+donor_sex <- ifelse(phenotypes$SEX == 1, "M", "F")
+message("Sex counts for donors matched to the expression table:")
+print(table(donor_sex[donor_ids %in% rownames(expression)]))
 
-new_trts = sex_table[sex_table$GTEx_ID %in% row.names(working_dataset),]
-table(new_trts$sexMF)
+# 2. Define the pancreas target genes and annotate secreted candidates.
+#    Use the historical UniProt files to reproduce the manuscript ranking.
+#    Text matching includes GO descriptions such as regulation of insulin secretion.
+ontology <- read.delim(input_files[["ontology"]])
+pathway_genes <- ontology$Gene.names...primary..[
+  grepl("insulin secretion", ontology$Gene.ontology..biological.process.)
+]
+secreted <- read.delim(input_files[["secreted"]], check.names = FALSE)
+secreted_genes <- secreted[["Gene names  (primary )"]]
 
+source_tissues <- c(
+  "Adipose - Subcutaneous", "Adipose - Visceral (Omentum)",
+  "Small Intestine - Terminal Ileum", "Stomach", "Thyroid",
+  "Muscle - Skeletal", "Pituitary", "Liver", "Kidney - Cortex",
+  "Heart - Left Ventricle", "Colon - Sigmoid", "Adrenal Gland", "Artery - Aorta"
+)
+gene_symbol <- function(x) sub("_.*", "", x)
+tissue_name <- function(x) sub(".*_", "", x)
+target_tissue <- "Pancreas"
 
-#read in Secreted Proteins
-Secreted_proteins <- read.delim("G:/My Drive/lab files/pancreas targeting/GTEx islet enrichments/datasets/uniprot-secreted-filtered-organism__Homo+sapiens+(Human)+[9606]_.tab", header = T, check.names = F)
-Secreted_proteins[1:10,1:5]
+# 3. Calculate Ssec for each source gene–tissue pair.
+#    WGCNA uses biweight midcorrelation with pairwise complete observations.
+#    Ssec is the mean of -log10(p) over the target pathway genes. The
+#    original workflow replaces missing and zero p-values with 0.5.
+#    The score summarizes association strength across both directions.
+score_pathway <- function(source, target) {
+  if (!ncol(source) || !ncol(target)) {
+    stop("No expression columns matched the source tissue or target pathway.")
+  }
+  p_values <- WGCNA::bicorAndPvalue(
+    source, target, use = "pairwise.complete.obs"
+  )$p
+  p_values[is.na(p_values) | p_values == 0] <- 0.5
+  scores <- data.frame(
+    Ssec_score = rowMeans(-log10(p_values)),
+    gene_tissue = colnames(source)
+  )
+  scores[order(scores$Ssec_score, decreasing = TRUE), , drop = FALSE]
+}
 
-deg_table = read.delim('G:/My Drive/lab files/pancreas targeting/GTEx islet enrichments/datasets/uniprot-human-genes and goterms mapping.tab')
+expression_tissues <- tissue_name(colnames(expression))
+pathway_columns <- gene_symbol(colnames(expression)) %in% pathway_genes
+pancreas_pathway <- expression[, expression_tissues == target_tissue & pathway_columns,
+                               drop = FALSE]
+message(nrow(expression), " GTEx donor rows and ", ncol(pancreas_pathway),
+        " pancreatic pathway expression columns.")
+scores <- score_pathway(
+  expression[, expression_tissues %in% source_tissues, drop = FALSE],
+  pancreas_pathway
+)
 
-path_set = deg_table[grepl('insulin secretion', deg_table$Gene.ontology..biological.process.),]
+# 4. Label and export the rankings. The original significance flag uses
+#    a descriptive cutoff of three standard deviations above the mean Ssec.
+scores$gene_symbol <- gene_symbol(scores$gene_tissue)
+scores$secreted <- ifelse(scores$gene_symbol %in% secreted_genes, "Secreted", "Non-secreted")
+cutoff <- mean(scores$Ssec_score + 3 * sd(scores$Ssec_score))
+scores$Sig_P1e3 <- ifelse(scores$Ssec_score > cutoff, "Significant", "NS")
+scores$rank_overall <- seq_len(nrow(scores))
+secreted_scores <- scores[scores$secreted == "Secreted", , drop = FALSE]
+secreted_scores$rank_secreted <- seq_len(nrow(secreted_scores))
 
-tissue1 <- working_dataset[,grepl('Adipose - Subcutaneous', colnames(working_dataset)) | grepl('Adipose - Visceral (Omentum)', colnames(working_dataset), fixed=T) | grepl('Small Intestine - Terminal Ileum', colnames(working_dataset), fixed=T) | grepl('Stomach', colnames(working_dataset), fixed=T) | grepl('Thyroid', colnames(working_dataset), fixed=T) | grepl('Muscle - Skeletal', colnames(working_dataset), fixed=T) | grepl('Pituitary', colnames(working_dataset), fixed=T) | grepl('Liver', colnames(working_dataset), fixed=T) | grepl('Kidney - Cortex', colnames(working_dataset), fixed=T) | grepl('Heart - Left Ventricle', colnames(working_dataset), fixed=T) | grepl('Colon - Sigmoid', colnames(working_dataset), fixed=T) | grepl('Adrenal Gland', colnames(working_dataset), fixed=T) |  grepl('Artery - Aorta', colnames(working_dataset), fixed=T),]
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+write.table(scores, file.path(output_dir, "all_scores.tsv"), sep = "\t", row.names = FALSE)
+write.table(secreted_scores, file.path(output_dir, "secreted_scores.tsv"),
+            sep = "\t", row.names = FALSE)
 
+# 5. Recreate the ranking plots. Use one color per secretion annotation.
+plot_scores <- function(data, title) {
+  ggplot(data, aes(x = forcats::fct_inorder(gene_tissue), y = Ssec_score,
+                   fill = secreted)) +
+    geom_col() +
+    scale_fill_manual(values = c("Secreted" = "darkorange1", "Non-secreted" = "darkorchid")) +
+    labs(title = title, x = "Gene and source tissue", y = "GTEx cross-tissue Ssec score",
+         fill = NULL) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 90, size = 8, vjust = 0.5, hjust = 1))
+}
 
-tissue2 <- working_dataset[,grepl('Pancreas', colnames(working_dataset)),]
-colnames(tissue2) = gsub("\\_.*","",colnames(tissue2))
-tissue2 = tissue2[,colnames(tissue2) %in% path_set$Gene.names...primary..]
-tissue.tissue.p = bicorAndPvalue(tissue1, tissue2, use='pairwise.complete.obs')
+pdf(file.path(output_dir, "plots.pdf"), width = 12, height = 7)
+significant <- scores[scores$Sig_P1e3 == "Significant", , drop = FALSE]
+if (nrow(significant)) {
+  pie(table(tissue_name(significant$gene_tissue)), main = "Tissue distribution of significant scores")
+  pie(table(tissue_name(head(significant$gene_tissue, 100))), main = "Tissue distribution of top 100")
+  print(plot_scores(head(significant, 50), "Top associations with pancreatic insulin secretion"))
+}
+if (nrow(secreted_scores)) {
+  print(plot_scores(head(secreted_scores, 40), "Top secreted candidates"))
+}
 
-tt1 = tissue.tissue.p$p
-tt1[is.na(tt1)] = 0.5
-tt1[tt1==0] = 0.5
-cc3 = as.data.frame(rowMeans(-log10(tt1)))
-
-colnames(cc3) = 'Ssec_score'
-cc3$gene_tissue = row.names(cc3)
-cc3 = cc3[order(cc3$Ssec_score, decreasing = T),]
-summary(cc3$Ssec_score)
-scores=cc3
-mean(scores$Ssec_score + (sd(scores$Ssec_score)*3))
-scores$gene_symbol =  gsub("\\_.*","",scores$gene_tissue)
-scores$secreted = ifelse(scores$gene_symbol %in% Secreted_proteins$`Gene names  (primary )`, 'Secreted', 'Non-secreted')
-table(scores$secreted)
-scores$Sig_P1e3 = ifelse(scores$Ssec_score > mean(scores$Ssec_score + (sd(scores$Ssec_score)*3)), 'Significant', 'NS')
-tissue_col_map = as.data.frame(table(gsub(".*_","",scores$gene_tissue)))
-tissue_col_map$col = c('darkorange2', 'blue1', 'firebrick1', 'darkorchid1')
-
-scores$tissue_col = tissue_col_map$col[match(gsub(".*_","",scores$gene_tissue), tissue_col_map$Var1)]
-scores$sec_color = ifelse(scores$secreted=='Secreted', 'darkorange1', 'darkorchid')
-
-scores1 = scores[scores$Sig_P1e3=='Significant',]
-table(gsub(".*_","",scores1$gene_tissue))
-
-pie(table(gsub(".*_","",scores1$gene_tissue)), main="Tissue distribution of significant cors", cex=0.8)
-
-scores1 = scores1[order(scores1$Ssec_score, decreasing = T),]
-scores2 = scores1[1:100,]
-pie(table(gsub(".*_","",scores2$gene_tissue)), main="Tissue distribution of top 100")
-
-scores2 = scores1[1:50,]
-library(forcats)
-ggplot(scores2, aes(x=fct_reorder2(gene_tissue, Ssec_score, Ssec_score, .desc = T), y=Ssec_score)) + geom_col(fill=scores2$sec_color) +  ggtitle('Top genes enriched for Insulin secretion pathways') + theme_minimal()  + xlab('gene') + ylab('cross-tissue score (Ssec) in GTEx')+ theme(axis.text.x = element_text(angle=90, size=8,vjust =0.5, hjust = 0.5), plot.title = element_text(hjust=0.5)) 
-
-ss1 = scores[scores$secreted=='Secreted',]
-scores2 = ss1[1:40,]
-
-ggplot(scores2, aes(x=fct_reorder2(gene_tissue, Ssec_score, Ssec_score, .desc = T), y=Ssec_score)) + geom_col(fill=scores2$sec_color) +  ggtitle('Top SECRETED genes enriched for Insulin secretion pathways') + theme_minimal()  + xlab('gene') + ylab('cross-tissue score (Ssec) in GTEx')+ theme(axis.text.x = element_text(angle=90, size=8,vjust =0.5, hjust = 0.5), plot.title = element_text(hjust=0.5)) 
-
-
-
-
-
-#look at relative enrichemnt within vs across tissues
-top_gene = ss1$gene_symbol[4]
-top_gene_target = paste0(top_gene, '_', 'Pancreas')
-top_gene_ttissues = 'Pancreas'
-top_gene_origin = ss1$gene_tissue[4]
-top_gene_otissues = gsub(".*_","",ss1$gene_tissue[4])
-
-
-#this should not require editing to run
-fc_table = scores
-fc_table$tissues = gsub(".*_","",fc_table$gene_tissue)
-fc_table1 = fc_table[fc_table$tissues==top_gene_otissues,]
-fc_table1$normSsec = fc_table1$Ssec_score/mean(fc_table1$Ssec_score)
-
-binned_com_table = fc_table1 %>% dplyr::select(gene_tissue, normSsec)
-binned_com_table$tissue_cat = paste0(top_gene_otissues, '-', top_gene_ttissues)
-
-#look at within target tissue comparisons
-tissue1 <- working_dataset[,grepl(top_gene_ttissues, colnames(working_dataset)),]
-tissue2 <- working_dataset[,grepl(top_gene_ttissues, colnames(working_dataset)),]
-colnames(tissue2) = gsub("\\_.*","",colnames(tissue2))
-tissue2 = tissue2[,colnames(tissue2) %in% path_set$Gene.names...primary..]
-tissue.tissue.p = bicorAndPvalue(tissue1, tissue2, use='pairwise.complete.obs')
-
-tt1 = tissue.tissue.p$p
-tt1[is.na(tt1)] = 0.5
-tt1[tt1==0] = 0.5
-cc3 = as.data.frame(rowMeans(-log10(tt1)))
-
-colnames(cc3) = 'Ssec_score'
-cc3$gene_tissue = row.names(cc3)
-cc3 = cc3[order(cc3$Ssec_score, decreasing = T),]
-cc3$normSsec = cc3$Ssec_score/mean(cc3$Ssec_score)
-new_table = cc3 %>% dplyr::select(gene_tissue, normSsec)
-new_table$tissue_cat = paste0(top_gene_ttissues, '-', top_gene_ttissues)
-binned_com_table = as.data.frame(rbind(binned_com_table, new_table))
-
-
-tissue1 <- working_dataset[,grepl(top_gene_otissues, colnames(working_dataset)),]
-tissue2 <- working_dataset[,grepl(top_gene_otissues, colnames(working_dataset)),]
-colnames(tissue2) = gsub("\\_.*","",colnames(tissue2))
-tissue2 = tissue2[,colnames(tissue2) %in% path_set$Gene.names...primary..]
-tissue.tissue.p = bicorAndPvalue(tissue1, tissue2, use='pairwise.complete.obs')
-
-tt1 = tissue.tissue.p$p
-tt1[is.na(tt1)] = 0.5
-tt1[tt1==0] = 0.5
-cc3 = as.data.frame(rowMeans(-log10(tt1)))
-
-colnames(cc3) = 'Ssec_score'
-cc3$gene_tissue = row.names(cc3)
-cc3 = cc3[order(cc3$Ssec_score, decreasing = T),]
-cc3$normSsec = cc3$Ssec_score/mean(cc3$Ssec_score)
-new_table = cc3 %>% dplyr::select(gene_tissue, normSsec)
-new_table$tissue_cat = paste0(top_gene_otissues, '-', top_gene_otissues)
-binned_com_table = as.data.frame(rbind(binned_com_table, new_table))
-
-binned_com_table$gene_symbol =  gsub("\\_.*","",binned_com_table$gene_tissue)
-
-
-#now compare
-sec_comp = binned_com_table[binned_com_table$gene_symbol==top_gene,]
-
-ggplot(sec_comp, aes(x=tissue_cat, y=normSsec, fill=tissue_cat)) + geom_col(show.legend = FALSE) + theme_classic() + scale_fill_manual(values = c('brown1', 'darkorchid2', 'dodgerblue3')) + ylab('Normalized Ssec score') + xlab('') + ggtitle(paste0('Within vs across scores ', top_gene, ' ', top_gene_otissues, '-', top_gene_ttissues))
+# 6. Compare within- and cross-tissue Ssec for one candidate.
+#    The original script chose the fourth-ranked secreted gene–tissue pair.
+#    For each comparison, divide Ssec by its mean across all source genes
+#    before retrieving the selected gene's score.
+comparison_rank <- 4L
+if (nrow(secreted_scores) >= comparison_rank) {
+  candidate <- secreted_scores[comparison_rank, ]
+  origin <- tissue_name(candidate$gene_tissue)
+  origin_columns <- expression_tissues == origin
+  pancreas_columns <- expression_tissues == target_tissue
+  comparisons <- list(
+    scores[tissue_name(scores$gene_tissue) == origin, , drop = FALSE],
+    score_pathway(expression[, pancreas_columns, drop = FALSE], pancreas_pathway),
+    score_pathway(expression[, origin_columns, drop = FALSE],
+                  expression[, origin_columns & pathway_columns, drop = FALSE])
+  )
+  names(comparisons) <- c(paste(origin, target_tissue, sep = " to "),
+                          paste(target_tissue, target_tissue, sep = " to "),
+                          paste(origin, origin, sep = " to "))
+  comparison <- do.call(rbind, lapply(names(comparisons), function(label) {
+    data <- comparisons[[label]]
+    normalized <- data$Ssec_score / mean(data$Ssec_score)
+    keep <- gene_symbol(data$gene_tissue) == candidate$gene_symbol
+    data.frame(comparison = rep(label, sum(keep)), gene_tissue = data$gene_tissue[keep],
+               normalized_Ssec = normalized[keep])
+  }))
+  print(ggplot(comparison, aes(comparison, normalized_Ssec, fill = comparison)) +
+          geom_col(show.legend = FALSE) +
+          labs(title = paste("Within- and cross-tissue scores for", candidate$gene_symbol),
+               x = NULL, y = "Normalized Ssec score") +
+          theme_classic())
+}
+invisible(dev.off())
+print(sessionInfo())
