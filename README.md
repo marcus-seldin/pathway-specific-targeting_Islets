@@ -7,3 +7,6 @@ Perform cross-organ correlations using a filtered version of GTEx (v8) to retain
 These analyses focus on GO Terms corresponding to insulin secretion whcih can be easily exchanged for any pathway in any organ  
 
 If any datasets or insight would help, please contact mseldin@uci.edu
+
+All datasets used for the analysis proposed are provided here:
+https://drive.google.com/drive/folders/1ESiTRAQA--LecraBZzAVdWK7iKkliMGF?usp=sharing
