@@ -1,6 +1,3 @@
-# pathway-specific-targeting_Islets
-Scripts corresponding to inter-organ genetic correlation analyses based on pathway-specific targeting
-
 # Pathway-specific targeting of pancreatic function
 
 These R scripts use filtered GTEx v8 expression data to prioritize candidate regulators of pancreatic processes. The original analysis ranks genes from 13 source tissues by how strongly their expression correlates across donors with insulin-secretion transcripts in bulk pancreas. The companion scripts apply the same scoring approach to pancreatic transcript panels for HGF, FGF21, and SERPINB1.
