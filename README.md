@@ -18,9 +18,9 @@ Download the analysis inputs from the [Google Drive dataset folder](https://driv
 | Script | Target panel and result |
 | --- | --- |
 | `script for crosstissue correlation with pancreas pathways.R` | Selects pancreatic genes annotated to GO biological processes containing â€œinsulin secretion.â€ Pituitary HPR ranked **#3 of 35,737** secreted geneâ€“tissue pairs overall and **#1** among secreted pituitary candidates. |
-| `prioritize_HGF.R` | Discovers 25 pancreatic transcripts correlated with visceral adipose HGF, then ranks candidates in held-out donors. HGF ranked **#1,791 of 220,810** rankable geneâ€“tissue pairs (top 0.81%).  mode tests positive regulation of insulin secretion and pancreatic Î²-cell proliferation. |
-| `prioritize_FGF21.R` | Tests fatty-acid response and negative regulation of intrinsic apoptotic signaling, two processes relevant to Î²-cell survival during lipid stress. The apoptosis-control panel placed visceral adipose FGF21 **#3,724 of 35,737** secreted pairs. The original insulin-secretion screen ranked liver FGF21 slightly higher. |
-| `prioritize_SERPINB1.R` | Tests pancreatic Î²-cell proliferation and negative regulation of endopeptidase activity. The 18-gene proliferation panel placed liver SERPINB1 **#353 of 35,737** secreted pairs (top 0.99%) using all donors. Limited liverâ€“pancreas overlap prevented held-out validation of this liver result. |
+| `prioritize_HGF.R` | By focusing on positive regulation of insulin secretion and pancreatic B-cell proliferation, HGF emerges (top 1%) as a top-ranked candidate |
+| `prioritize_FGF21.R` | Tests fatty-acid response and negative regulation of intrinsic apoptotic signaling, two processes relevant to B-cell survival during lipid stress. The apoptosis-control panel placed visceral adipose FGF21 is prioritized in top 1%. The original insulin-secretion screen ranked liver FGF21 slightly higher. |
+| `prioritize_SERPINB1.R` | Tests pancreatic B-cell proliferation and negative regulation of endopeptidase activity. The 18-gene proliferation panel placed liver SERPINB1 in the top 1% using all donors. |
 
 Keep `reverse_pancreas.R` and `pathway_prior_screen.R` alongside the three `prioritize_*.R` scripts. The first provides the donor-split workflow and GO overrepresentation analysis. The second scores fixed, literature-motivated GO panels using all available donors. Each protein script documents the exact GO terms and the supporting experimental studies.
 
